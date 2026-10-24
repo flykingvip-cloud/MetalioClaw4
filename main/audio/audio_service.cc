@@ -126,6 +126,7 @@ void AudioService::Stop() {
         AS_EVENT_AUDIO_PROCESSOR_RUNNING);
 
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    ++playback_generation_;
     audio_encode_queue_.clear();
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
@@ -321,6 +322,7 @@ void AudioService::OpusCodecTask() {
         if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
             auto packet = std::move(audio_decode_queue_.front());
             audio_decode_queue_.pop_front();
+            const uint32_t generation = playback_generation_;
             audio_queue_cv_.notify_all();
             lock.unlock();
 
@@ -328,22 +330,30 @@ void AudioService::OpusCodecTask() {
             task->type = kAudioTaskTypeDecodeToPlaybackQueue;
             task->timestamp = packet->timestamp;
 
-            SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
-            if (opus_decoder_->Decode(std::move(packet->payload), task->pcm)) {
-                // Resample if the sample rate is different
-                if (opus_decoder_->sample_rate() != codec_->output_sample_rate()) {
-                    int target_size = output_resampler_.GetOutputSamples(task->pcm.size());
-                    std::vector<int16_t> resampled(target_size);
-                    output_resampler_.Process(task->pcm.data(), task->pcm.size(), resampled.data());
-                    task->pcm = std::move(resampled);
+            bool decoded = false;
+            {
+                // 与 ResetDecoder 的 ResetState 互斥，避免打断时解码器被并发复位。
+                std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
+                SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
+                if (opus_decoder_->Decode(std::move(packet->payload), task->pcm)) {
+                    // Resample if the sample rate is different
+                    if (opus_decoder_->sample_rate() != codec_->output_sample_rate()) {
+                        int target_size = output_resampler_.GetOutputSamples(task->pcm.size());
+                        std::vector<int16_t> resampled(target_size);
+                        output_resampler_.Process(task->pcm.data(), task->pcm.size(), resampled.data());
+                        task->pcm = std::move(resampled);
+                    }
+                    decoded = true;
+                } else {
+                    ESP_LOGE(TAG, "Failed to decode audio");
                 }
+            }
 
-                lock.lock();
+            lock.lock();
+            // 代次已变（AbortSpeaking / ResetDecoder）则丢弃在途解码结果，不再入播放队列。
+            if (decoded && generation == playback_generation_) {
                 audio_playback_queue_.push_back(std::move(task));
                 audio_queue_cv_.notify_all();
-            } else {
-                ESP_LOGE(TAG, "Failed to decode audio");
-                lock.lock();
             }
             debug_statistics_.decode_count++;
         }
@@ -655,7 +665,11 @@ bool AudioService::IsIdle() {
 
 void AudioService::ResetDecoder() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    opus_decoder_->ResetState();
+    ++playback_generation_;
+    {
+        std::lock_guard<std::mutex> decoder_lock(decoder_mutex_);
+        opus_decoder_->ResetState();
+    }
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();

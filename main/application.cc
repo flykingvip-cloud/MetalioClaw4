@@ -571,6 +571,10 @@ void Application::Start() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+        // aborted_ 在打断后保持，直到下一轮 tts start，避免队列刚清空又被旧音频填上。
+        if (aborted_) {
+            return;
+        }
         if (device_state_ == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
@@ -811,6 +815,8 @@ void Application::OnWakeWordDetected() {
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
+    // 与 ResetDecoder 相同：清空解码/播放队列并推进 generation，丢弃在途解码结果。
+    audio_service_.ResetDecoder();
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }
