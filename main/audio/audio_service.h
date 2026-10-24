@@ -143,12 +143,15 @@ private:
     TaskHandle_t audio_output_task_handle_ = nullptr;
     TaskHandle_t opus_codec_task_handle_ = nullptr;
     std::mutex audio_queue_mutex_;
+    std::mutex decoder_mutex_;
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
+    // ResetDecoder 递增。解码线程取出包时记下代次，入播放队列前再比对，避免清空后在途 PCM 回流。
+    uint32_t playback_generation_ = 0;
 
     bool wake_word_initialized_ = false;
     bool audio_processor_initialized_ = false;

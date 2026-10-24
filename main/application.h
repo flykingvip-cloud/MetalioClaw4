@@ -123,7 +123,8 @@ private:
     bool TryEnableWakeWordForVoiceUi();
 
     bool has_server_time_ = false;
-    bool aborted_ = false;
+    // 协议回调线程会读；打断后为 true，下一轮 tts start 清掉。
+    volatile bool aborted_ = false;
     int clock_ticks_ = 0;
     TaskHandle_t check_new_version_task_handle_ = nullptr;
     TaskHandle_t main_event_loop_task_handle_ = nullptr;
