@@ -63,6 +63,9 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     }
 
     afe_config->agc_init = false;
+    // 大块权重在 PSRAM（2.0.53 实测约 848KB）。剩下的内部堆不能落到 LP/RTC：
+    // P4 上 CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP 会把 0x5010xxxx 并进 heap，
+    // LSTM 的向量 load 访问这块会 Load access fault。
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
     // 内部 AFE 任务与 feed（core0 / 较高优先级）分开，避免 FEED ring 只进不出。
     afe_config->afe_perferred_core = 1;
@@ -156,12 +159,37 @@ void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
 }
 
 void AfeAudioProcessor::Start() {
-    std::lock_guard<std::mutex> lock(afe_mutex_);
     // 新一轮聆听不要继承上一轮的“正在说话”，否则一进来就因静音立刻 listen.stop。
     is_speaking_ = false;
-    if (afe_data_ != nullptr && afe_iface_ != nullptr && afe_iface_->reset_vad != nullptr) {
-        afe_iface_->reset_vad(afe_data_);
+    fetch_ok_ = false;
+
+    size_t chunk = 0;
+    int channels = 1;
+    {
+        std::lock_guard<std::mutex> lock(afe_mutex_);
+        if (afe_data_ != nullptr && afe_iface_ != nullptr) {
+            if (afe_iface_->reset_vad != nullptr) {
+                afe_iface_->reset_vad(afe_data_);
+            }
+            chunk = afe_iface_->get_feed_chunksize(afe_data_);
+            if (codec_ != nullptr && codec_->input_channels() > 0) {
+                channels = codec_->input_channels();
+            }
+        }
     }
+
+    // 输入任务有约 120ms 预热，fetch 超时只有 100ms。先灌静音，避免第一帧
+    // 打在空 ring 上（2.0.53：empty → ESP_FAIL → reset_buffer → LSTM panic）。
+    if (chunk > 0) {
+        constexpr int kPrimeChunks = 4;
+        std::vector<int16_t> silence(chunk * static_cast<size_t>(channels), 0);
+        for (int i = 0; i < kPrimeChunks; ++i) {
+            Feed(std::vector<int16_t>(silence));
+        }
+        ESP_LOGI(TAG, "Primed %d silent chunks (%u samples/ch) before fetch",
+                 kPrimeChunks, static_cast<unsigned>(chunk));
+    }
+
     xEventGroupSetBits(event_group_, PROCESSOR_RUNNING);
 }
 
@@ -225,7 +253,16 @@ void AfeAudioProcessor::AudioProcessorTask() {
             continue;
         }
         if (res->ret_value == ESP_FAIL) {
-            // fetch 失败时 FEED ring 不会被消费，feed() 会周期性报 ringbuffer full。
+            // 空 ring（还没有任何成功帧）是启动空窗，不是溢出。此时 reset_buffer
+            // 会重入尚未喂数的 LSTM，2.0.53 在这里 Load access fault。
+            if (!fetch_ok_) {
+                static int empty_fails = 0;
+                ++empty_fails;
+                if (empty_fails == 1 || empty_fails % 50 == 0) {
+                    ESP_LOGW(TAG, "AFE fetch empty (ESP_FAIL), skip reset (%d)", empty_fails);
+                }
+                continue;
+            }
             std::lock_guard<std::mutex> lock(afe_mutex_);
             if (afe_data_ != nullptr && afe_iface_ != nullptr) {
                 afe_iface_->reset_buffer(afe_data_);
@@ -235,9 +272,11 @@ void AfeAudioProcessor::AudioProcessorTask() {
             if (fetch_failures == 1 || fetch_failures % 50 == 0) {
                 ESP_LOGW(TAG, "AFE fetch failed (ESP_FAIL), reset feed ring (%d)", fetch_failures);
             }
+            fetch_ok_ = false;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+        fetch_ok_ = true;
 
         // VAD state change
         if (vad_state_change_callback_) {

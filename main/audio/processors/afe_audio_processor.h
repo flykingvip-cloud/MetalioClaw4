@@ -40,6 +40,8 @@ private:
     // Feed / destroy 与 fetch 握手。fetch_with_delay 期间不持锁。
     mutable std::mutex afe_mutex_;
     std::atomic<bool> fetching_{false};
+    // 成功取过一帧之后，ESP_FAIL 才允许 reset。空 ring 上 reset 会踩到 LSTM。
+    std::atomic<bool> fetch_ok_{false};
     std::function<void(std::vector<int16_t>&& data)> output_callback_;
     std::function<void(bool speaking)> vad_state_change_callback_;
     AudioCodec* codec_ = nullptr;
