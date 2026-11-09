@@ -40,9 +40,12 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
     afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
     afe_config->vad_mode = VAD_MODE_0;
-    afe_config->vad_min_noise_ms = 100;
+    // 设备侧断句：连续静音达到该值才报 VAD_SILENCE。100ms 会在词间把句子切断。
+    afe_config->vad_min_noise_ms = 800;
     if (vad_model_name != nullptr) {
         afe_config->vad_model_name = vad_model_name;
+    } else {
+        ESP_LOGW(TAG, "vadnet model not in srmodels, falling back to WebRTC VAD");
     }
 
     if (ns_model_name != nullptr) {
@@ -51,18 +54,34 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         afe_config->afe_ns_mode = AFE_NS_MODE_NET;
     } else {
         afe_config->ns_init = false;
+        ESP_LOGW(TAG, "nsnet model not in srmodels, noise suppression stays off");
     }
 
     afe_config->agc_init = false;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    // 内部 AFE 任务与 feed（core0 / 较高优先级）分开，避免 FEED ring 只进不出。
+    afe_config->afe_perferred_core = 1;
+    afe_config->afe_perferred_priority = 5;
 
-    // AEC 模块预创建，运行时由 EnableDeviceAec() 在 AEC/VAD 间切换（勿与唤醒词 AFE 同时常驻）
+    // enable_vad / enable_aec 只对 create 时打开的模块生效。vad_init=false 时
+    // enable_vad 会报 "VAD is not initialized"，断句永远不会发生。
+    // AEC 与 VAD 同时创建：打断只额外打开 AEC，VAD 保持可用。
     afe_config->aec_init = true;
-    afe_config->vad_init = false;
+    afe_config->vad_init = true;
+    ESP_LOGI(TAG, "Chat AFE models: vad=%s ns=%s",
+             vad_model_name != nullptr ? vad_model_name : "webrtc",
+             ns_model_name != nullptr ? ns_model_name : "off");
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);
-    afe_data_ = afe_iface_->create_from_config(afe_config);
-    
+    afe_data_ = afe_iface_ != nullptr ? afe_iface_->create_from_config(afe_config) : nullptr;
+    afe_config_free(afe_config);
+    if (afe_iface_ == nullptr || afe_data_ == nullptr) {
+        ESP_LOGE(TAG, "create_from_config failed");
+        afe_iface_ = nullptr;
+        afe_data_ = nullptr;
+        return;
+    }
+
     xTaskCreate([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
@@ -92,6 +111,11 @@ void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
 }
 
 void AfeAudioProcessor::Start() {
+    // 新一轮聆听不要继承上一轮的“正在说话”，否则一进来就因静音立刻 listen.stop。
+    is_speaking_ = false;
+    if (afe_data_ != nullptr && afe_iface_ != nullptr && afe_iface_->reset_vad != nullptr) {
+        afe_iface_->reset_vad(afe_data_);
+    }
     xEventGroupSetBits(event_group_, PROCESSOR_RUNNING);
 }
 
@@ -128,9 +152,18 @@ void AfeAudioProcessor::AudioProcessorTask() {
             continue;
         }
         if (res == nullptr || res->ret_value == ESP_FAIL) {
-            if (res != nullptr) {
-                ESP_LOGI(TAG, "Error code: %d", res->ret_value);
+            // fetch 失败时 FEED ring 不会被消费，feed() 会周期性报 ringbuffer full。
+            // 丢掉积压，让后续音频重新对齐，而不是一直覆盖旧帧。
+            if (afe_data_ != nullptr) {
+                afe_iface_->reset_buffer(afe_data_);
             }
+            static int fetch_failures = 0;
+            ++fetch_failures;
+            if (fetch_failures == 1 || fetch_failures % 50 == 0) {
+                ESP_LOGW(TAG, "AFE fetch failed (%s), reset feed ring (%d)",
+                         res == nullptr ? "null" : "ESP_FAIL", fetch_failures);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
@@ -173,11 +206,11 @@ void AfeAudioProcessor::EnableDeviceAec(bool enable) {
         ESP_LOGE(TAG, "EnableDeviceAec: AFE not initialized");
         return;
     }
+    // VAD 始终开着，打断与否都能在静音后断句。AEC 只在打断打开时启用。
+    afe_iface_->enable_vad(afe_data_);
     if (enable) {
-        afe_iface_->disable_vad(afe_data_);
         afe_iface_->enable_aec(afe_data_);
     } else {
         afe_iface_->disable_aec(afe_data_);
-        afe_iface_->enable_vad(afe_data_);
     }
 }

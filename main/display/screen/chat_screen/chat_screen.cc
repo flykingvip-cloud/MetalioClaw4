@@ -280,6 +280,10 @@ bool chat_status_for_state(DeviceState state, const char** text, uint32_t* color
             *text = "聆听中";
             *color = kColorStateListening;
             return true;
+        case kDeviceStateThinking:
+            *text = "思考中";
+            *color = kColorStateConnecting;
+            return true;
         case kDeviceStateSpeaking:
             *text = "讲话中";
             *color = kColorStateSpeaking;

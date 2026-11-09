@@ -744,10 +744,11 @@ enum class Str : uint16_t {
     C5_FW_VERSION_UNAVAILABLE = 725,
     C5_FW_NEED_NETWORK = 726,
     C5_FW_REBOOT_HINT = 727,
-    C5_FW_READING_VERSION = 728
+    C5_FW_READING_VERSION = 728,
+    THINKING = 729
 };
 
-constexpr size_t kStringCount = 729;
+constexpr size_t kStringCount = 730;
 
 struct LocaleInfo {
     Locale id;
@@ -1492,6 +1493,7 @@ inline constexpr const char* kMsgIds[kStringCount] = {
     "请先连接网络",
     "更新完成后设备会自动重启",
     "正在读取版本…",
+    "思考中",
 };
 
 inline constexpr const char* kStringsZhCN[kStringCount] = {
@@ -2224,6 +2226,7 @@ inline constexpr const char* kStringsZhCN[kStringCount] = {
     "请先连接网络",
     "更新完成后设备会自动重启",
     "正在读取版本…",
+    "思考中",
 };
 
 inline constexpr const char* kStringsEnUS[kStringCount] = {
@@ -2956,6 +2959,7 @@ inline constexpr const char* kStringsEnUS[kStringCount] = {
     "Connect to network first",
     "Device reboots after update",
     "Reading version…",
+    "Thinking",
 };
 
 inline constexpr const char* const* kLocaleTables[kLocaleCount] = {

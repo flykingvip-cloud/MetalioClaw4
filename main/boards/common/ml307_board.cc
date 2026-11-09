@@ -37,7 +37,8 @@ void Ml307Board::StartNetwork() {
         } else {
             ESP_LOGE(TAG, "Network is down");
             auto device_state = application.GetDeviceState();
-            if (device_state == kDeviceStateListening || device_state == kDeviceStateSpeaking) {
+            if (device_state == kDeviceStateListening || device_state == kDeviceStateSpeaking ||
+                device_state == kDeviceStateThinking) {
                 application.Schedule([this, &application]() {
                     application.SetDeviceState(kDeviceStateIdle);
                 });

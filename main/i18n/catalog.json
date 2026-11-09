@@ -3658,6 +3658,11 @@
       "key": "C5_FW_READING_VERSION",
       "zh-CN": "正在读取版本…",
       "en-US": "Reading version…"
+    },
+    {
+      "key": "THINKING",
+      "zh-CN": "思考中",
+      "en-US": "Thinking"
     }
   ]
 }

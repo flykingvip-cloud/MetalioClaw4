@@ -522,6 +522,7 @@ void AudioService::EnableVoiceProcessing(bool enable) {
         /* We should make sure no audio is playing */
         ResetDecoder();
         audio_input_need_warmup_ = true;
+        voice_detected_ = false;
         audio_processor_->Start();
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     } else {
