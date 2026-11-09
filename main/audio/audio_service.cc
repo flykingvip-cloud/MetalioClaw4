@@ -1,4 +1,5 @@
 #include "audio_service.h"
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <cstring>
 
@@ -471,6 +472,11 @@ void AudioService::EnableWakeWordDetection(bool enable) {
         return;
     }
 
+    if (enable) {
+        // 先拆对话 AFE，再创建唤醒词 AFE。NSNet/VadNet/WakeNet 不能两套同时跑。
+        ReleaseAudioProcessor();
+    }
+
     std::lock_guard<std::mutex> lock(wake_word_mutex_);
     ESP_LOGI(TAG, "%s wake word detection (initialized=%d)",
              enable ? "Enabling" : "Disabling", wake_word_initialized_ ? 1 : 0);
@@ -485,8 +491,7 @@ void AudioService::EnableWakeWordDetection(bool enable) {
         wake_word_->Start();
         xEventGroupSetBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
     } else {
-        // 会话内软停：停 Feed + disable_wakenet，保留 AFE（Listening↔Idle 频繁切换）。
-        // 回桌面必须再调 ReleaseWakeWordEngine() 真正 destroy。
+        // 软停。聆听开始时 EnableVoiceProcessing 会先 ReleaseWakeWordEngine，把 AFE 拆掉。
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
         wake_word_->Stop();
     }
@@ -509,11 +514,28 @@ void AudioService::ReleaseWakeWordEngine() {
     }
 }
 
+void AudioService::ReleaseAudioProcessor() {
+    xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+    if (!audio_processor_initialized_ || !audio_processor_) {
+        return;
+    }
+    ESP_LOGI(TAG, "Releasing chat AFE");
+    audio_processor_->Stop();
+    audio_processor_->Deinitialize();
+    audio_processor_initialized_ = false;
+}
+
 void AudioService::EnableVoiceProcessing(bool enable) {
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
     if (enable) {
+        // 对话链路带 NSNet + VadNet。唤醒词 AFE 还在时创建它会在 LSTM 里踩到坏指针。
+        ReleaseWakeWordEngine();
         if (!audio_processor_initialized_) {
             audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
+            if (!audio_processor_->IsReady()) {
+                ESP_LOGE(TAG, "chat AFE create failed");
+                return;
+            }
             audio_processor_initialized_ = true;
         }
         // 每次启动都同步打断偏好，避免仅首次 init 后 AEC 状态漂移
@@ -547,7 +569,7 @@ void AudioService::EnableAudioTesting(bool enable) {
 void AudioService::EnableDeviceAec(bool enable) {
     device_aec_enabled_ = enable;
     if (!audio_processor_initialized_) {
-        // 空闲态只有唤醒词 AFE；此时创建通信 AFE（含 AEC）会与 WakeNet 抢 PSRAM 导致崩溃
+        // 空闲态只有唤醒词 AFE。对话 AFE 要等进入聆听、唤醒词引擎拆掉之后再创建。
         ESP_LOGI(TAG, "device AEC preference %s (deferred until voice processing)",
                  enable ? "on" : "off");
         return;

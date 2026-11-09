@@ -1,4 +1,5 @@
 #include "afe_audio_processor.h"
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 
 #define PROCESSOR_RUNNING 0x01
@@ -16,6 +17,10 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
 
     // Pre-allocate output buffer capacity
     output_buffer_.reserve(frame_samples_);
+
+    if (afe_data_ != nullptr) {
+        return;
+    }
 
     int ref_num = codec_->input_reference() ? 1 : 0;
 
@@ -72,21 +77,59 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
              vad_model_name != nullptr ? vad_model_name : "webrtc",
              ns_model_name != nullptr ? ns_model_name : "off");
 
+    ESP_LOGI(TAG, "Creating chat AFE, internal=%uKB psram=%uKB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_ != nullptr ? afe_iface_->create_from_config(afe_config) : nullptr;
     afe_config_free(afe_config);
     if (afe_iface_ == nullptr || afe_data_ == nullptr) {
-        ESP_LOGE(TAG, "create_from_config failed");
+        ESP_LOGE(TAG, "create_from_config failed, internal=%uKB psram=%uKB",
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
         afe_iface_ = nullptr;
         afe_data_ = nullptr;
         return;
     }
+    ESP_LOGI(TAG, "Chat AFE created, internal=%uKB psram=%uKB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 
-    xTaskCreate([](void* arg) {
-        auto this_ = (AfeAudioProcessor*)arg;
-        this_->AudioProcessorTask();
-        vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL);
+    if (fetch_task_ == nullptr) {
+        // 栈只跑 fetch 循环和输出回调；LSTM 在 AFE 内部任务。4KB 偏紧，放到 8KB。
+        xTaskCreate([](void* arg) {
+            auto this_ = (AfeAudioProcessor*)arg;
+            this_->AudioProcessorTask();
+            vTaskDelete(NULL);
+        }, "audio_communication", 8192, this, 3, &fetch_task_);
+    }
+}
+
+void AfeAudioProcessor::Deinitialize() {
+    Stop();
+    for (int i = 0; i < 40 && fetching_.load(std::memory_order_acquire); ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (fetching_.load(std::memory_order_acquire)) {
+        ESP_LOGW(TAG, "Deinitialize: fetch still in progress, destroying anyway");
+    }
+
+    std::lock_guard<std::mutex> lock(afe_mutex_);
+    if (afe_data_ == nullptr || afe_iface_ == nullptr) {
+        afe_data_ = nullptr;
+        afe_iface_ = nullptr;
+        return;
+    }
+    ESP_LOGI(TAG, "Destroying chat AFE");
+    afe_iface_->destroy(afe_data_);
+    afe_data_ = nullptr;
+    afe_iface_ = nullptr;
+}
+
+bool AfeAudioProcessor::IsReady() const {
+    std::lock_guard<std::mutex> lock(afe_mutex_);
+    return afe_data_ != nullptr && afe_iface_ != nullptr;
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {
@@ -97,20 +140,23 @@ AfeAudioProcessor::~AfeAudioProcessor() {
 }
 
 size_t AfeAudioProcessor::GetFeedSize() {
-    if (afe_data_ == nullptr) {
+    std::lock_guard<std::mutex> lock(afe_mutex_);
+    if (afe_data_ == nullptr || afe_iface_ == nullptr) {
         return 0;
     }
     return afe_iface_->get_feed_chunksize(afe_data_);
 }
 
 void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
-    if (afe_data_ == nullptr) {
+    std::lock_guard<std::mutex> lock(afe_mutex_);
+    if (afe_data_ == nullptr || afe_iface_ == nullptr) {
         return;
     }
     afe_iface_->feed(afe_data_, data.data());
 }
 
 void AfeAudioProcessor::Start() {
+    std::lock_guard<std::mutex> lock(afe_mutex_);
     // 新一轮聆听不要继承上一轮的“正在说话”，否则一进来就因静音立刻 listen.stop。
     is_speaking_ = false;
     if (afe_data_ != nullptr && afe_iface_ != nullptr && afe_iface_->reset_vad != nullptr) {
@@ -121,7 +167,8 @@ void AfeAudioProcessor::Start() {
 
 void AfeAudioProcessor::Stop() {
     xEventGroupClearBits(event_group_, PROCESSOR_RUNNING);
-    if (afe_data_ != nullptr) {
+    std::lock_guard<std::mutex> lock(afe_mutex_);
+    if (afe_data_ != nullptr && afe_iface_ != nullptr) {
         afe_iface_->reset_buffer(afe_data_);
     }
 }
@@ -139,29 +186,54 @@ void AfeAudioProcessor::OnVadStateChange(std::function<void(bool speaking)> call
 }
 
 void AfeAudioProcessor::AudioProcessorTask() {
-    auto fetch_size = afe_iface_->get_fetch_chunksize(afe_data_);
-    auto feed_size = afe_iface_->get_feed_chunksize(afe_data_);
+    int fetch_size = 0;
+    int feed_size = 0;
+    {
+        std::lock_guard<std::mutex> lock(afe_mutex_);
+        if (afe_iface_ != nullptr && afe_data_ != nullptr) {
+            fetch_size = afe_iface_->get_fetch_chunksize(afe_data_);
+            feed_size = afe_iface_->get_feed_chunksize(afe_data_);
+        }
+    }
     ESP_LOGI(TAG, "Audio communication task started, feed size: %d fetch size: %d",
         feed_size, fetch_size);
 
     while (true) {
         xEventGroupWaitBits(event_group_, PROCESSOR_RUNNING, pdFALSE, pdTRUE, portMAX_DELAY);
 
-        auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
+        const esp_afe_sr_iface_t* iface = nullptr;
+        esp_afe_sr_data_t* data = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(afe_mutex_);
+            if (afe_iface_ == nullptr || afe_data_ == nullptr) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            fetching_.store(true, std::memory_order_release);
+            iface = afe_iface_;
+            data = afe_data_;
+        }
+
+        // 有限等待，Deinitialize 才能在停喂之后返回，而不是卡在 portMAX_DELAY。
+        auto res = iface->fetch_with_delay(data, pdMS_TO_TICKS(100));
+        fetching_.store(false, std::memory_order_release);
+
         if ((xEventGroupGetBits(event_group_) & PROCESSOR_RUNNING) == 0) {
             continue;
         }
-        if (res == nullptr || res->ret_value == ESP_FAIL) {
+        if (res == nullptr) {
+            continue;
+        }
+        if (res->ret_value == ESP_FAIL) {
             // fetch 失败时 FEED ring 不会被消费，feed() 会周期性报 ringbuffer full。
-            // 丢掉积压，让后续音频重新对齐，而不是一直覆盖旧帧。
-            if (afe_data_ != nullptr) {
+            std::lock_guard<std::mutex> lock(afe_mutex_);
+            if (afe_data_ != nullptr && afe_iface_ != nullptr) {
                 afe_iface_->reset_buffer(afe_data_);
             }
             static int fetch_failures = 0;
             ++fetch_failures;
             if (fetch_failures == 1 || fetch_failures % 50 == 0) {
-                ESP_LOGW(TAG, "AFE fetch failed (%s), reset feed ring (%d)",
-                         res == nullptr ? "null" : "ESP_FAIL", fetch_failures);
+                ESP_LOGW(TAG, "AFE fetch failed (ESP_FAIL), reset feed ring (%d)", fetch_failures);
             }
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
@@ -202,6 +274,7 @@ void AfeAudioProcessor::AudioProcessorTask() {
 }
 
 void AfeAudioProcessor::EnableDeviceAec(bool enable) {
+    std::lock_guard<std::mutex> lock(afe_mutex_);
     if (afe_iface_ == nullptr || afe_data_ == nullptr) {
         ESP_LOGE(TAG, "EnableDeviceAec: AFE not initialized");
         return;
