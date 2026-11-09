@@ -187,6 +187,7 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
             kDeviceStateStarting,
             kDeviceStateWifiConfiguring,
             kDeviceStateListening,
+            kDeviceStateThinking,
             kDeviceStateActivating,
         };
         if (std::find(allowed_states.begin(), allowed_states.end(), device_state) != allowed_states.end()) {

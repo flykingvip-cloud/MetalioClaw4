@@ -9,6 +9,7 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
+#include "i18n.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -46,6 +47,7 @@ static const char* const STATE_STRINGS[] = {
     "activating",
     "audio_testing",
     "fatal_error",
+    "thinking",
     "invalid_state"
 };
 
@@ -274,7 +276,8 @@ void Application::StopSystemAudioForStressTest() {
 
     if (device_state_ == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
-    } else if (device_state_ == kDeviceStateListening && protocol_) {
+    } else if ((device_state_ == kDeviceStateListening ||
+                device_state_ == kDeviceStateThinking) && protocol_) {
         protocol_->SendStopListening();
     }
 
@@ -289,7 +292,8 @@ void Application::StopSystemAudioForStressTest() {
 
     if (device_state_ == kDeviceStateListening ||
         device_state_ == kDeviceStateSpeaking ||
-        device_state_ == kDeviceStateConnecting) {
+        device_state_ == kDeviceStateConnecting ||
+        device_state_ == kDeviceStateThinking) {
         SetDeviceState(kDeviceStateIdle);
     }
 
@@ -369,7 +373,8 @@ void Application::ToggleChatState() {
         Schedule([this]() {
             AbortSpeaking(kAbortReasonNone);
         });
-    } else if (device_state_ == kDeviceStateListening) {
+    } else if (device_state_ == kDeviceStateListening ||
+               device_state_ == kDeviceStateThinking) {
         Schedule([this]() {
             if (protocol_) {
                 protocol_->CloseAudioChannel();
@@ -427,10 +432,11 @@ void Application::StopListening() {
         return;
     }
 
-    const std::array<int, 3> valid_states = {
+    const std::array<int, 4> valid_states = {
         kDeviceStateListening,
         kDeviceStateSpeaking,
         kDeviceStateIdle,
+        kDeviceStateThinking,
     };
     // If not valid, do nothing
     if (std::find(valid_states.begin(), valid_states.end(), device_state_) == valid_states.end()) {
@@ -440,6 +446,8 @@ void Application::StopListening() {
     Schedule([this]() {
         if (device_state_ == kDeviceStateListening) {
             protocol_->SendStopListening();
+            SetDeviceState(kDeviceStateIdle);
+        } else if (device_state_ == kDeviceStateThinking) {
             SetDeviceState(kDeviceStateIdle);
         }
     });
@@ -602,7 +610,9 @@ void Application::Start() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
-                    if (device_state_ == kDeviceStateIdle || device_state_ == kDeviceStateListening) {
+                    if (device_state_ == kDeviceStateIdle ||
+                        device_state_ == kDeviceStateListening ||
+                        device_state_ == kDeviceStateThinking) {
                         SetDeviceState(kDeviceStateSpeaking);
                     }
                 });
@@ -745,6 +755,13 @@ void Application::MainEventLoop() {
             if (device_state_ == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
+                // 手动模式由按键结束。自动停和打断（realtime）都在静音后发 listen.stop。
+                if (!audio_service_.IsVoiceDetected() &&
+                    listening_mode_ != kListeningModeManualStop && protocol_) {
+                    ESP_LOGI(TAG, "VAD end of utterance, listen.stop");
+                    protocol_->SendStopListening();
+                    SetDeviceState(kDeviceStateThinking);
+                }
             }
         }
 
@@ -874,6 +891,12 @@ void Application::SetDeviceState(DeviceState state) {
                 audio_service_.EnableVoiceProcessing(true);
                 audio_service_.EnableWakeWordDetection(false);
             }
+            break;
+        case kDeviceStateThinking:
+            display->SetStatus(I18n::T("思考中"));
+            display->SetEmotion("thinking");
+            audio_service_.EnableVoiceProcessing(false);
+            audio_service_.EnableWakeWordDetection(false);
             break;
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
@@ -1013,7 +1036,8 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
         Schedule([this]() {
             AbortSpeaking(kAbortReasonNone);
         });
-    } else if (device_state_ == kDeviceStateListening) {   
+    } else if (device_state_ == kDeviceStateListening ||
+               device_state_ == kDeviceStateThinking) {
         Schedule([this]() {
             if (protocol_) {
                 protocol_->CloseAudioChannel();
@@ -1231,7 +1255,8 @@ void Application::SetVoiceUiDesired(bool desired) {
 }
 
 void Application::ParkVoiceUiProtocol() {
-    if (device_state_ == kDeviceStateListening && protocol_) {
+    if ((device_state_ == kDeviceStateListening ||
+         device_state_ == kDeviceStateThinking) && protocol_) {
         protocol_->CloseAudioChannel();
     } else if (device_state_ == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
@@ -1244,7 +1269,8 @@ void Application::ParkVoiceUiProtocol() {
 
     if (device_state_ == kDeviceStateListening ||
         device_state_ == kDeviceStateSpeaking ||
-        device_state_ == kDeviceStateConnecting) {
+        device_state_ == kDeviceStateConnecting ||
+        device_state_ == kDeviceStateThinking) {
         SetDeviceState(kDeviceStateIdle);
     }
 }

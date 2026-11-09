@@ -217,6 +217,7 @@ void GpioLed::OnStateChanged() {
             // TurnOff();
             break;
         case kDeviceStateConnecting:
+        case kDeviceStateThinking:
             SetBrightness(DEFAULT_BRIGHTNESS);
             TurnOn();
             break;

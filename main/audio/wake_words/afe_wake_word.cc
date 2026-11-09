@@ -97,13 +97,24 @@ bool AfeWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) {
     for (int i = 0; i < ref_num; i++) {
         input_format.push_back('R');
     }
+    // 不把分区模型表传进去。传了的话 afe_config_init 会把 vadnet/nsnet 装进唤醒词 AFE，
+    // 和对话链路的同一套 LSTM 工作区叠在一起。唤醒词只点名 WakeNet，VAD 用 WebRTC。
     afe_config_t* afe_config =
-        afe_config_init(input_format.c_str(), models_, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+        afe_config_init(input_format.c_str(), nullptr, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
     afe_config->aec_init = codec_->input_reference();
     afe_config->aec_mode = AEC_MODE_SR_HIGH_PERF;
     afe_config->afe_perferred_core = 1;
     afe_config->afe_perferred_priority = 1;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    afe_config->wakenet_init = true;
+    afe_config->wakenet_model_name = wakenet_model_;
+    afe_config->wakenet_model_name_2 = nullptr;
+    afe_config->vad_init = true;
+    afe_config->vad_model_name = nullptr;
+    afe_config->ns_init = false;
+    afe_config->ns_model_name = nullptr;
+    ESP_LOGI(TAG, "Wake AFE uses WebRTC VAD, wakenet=%s",
+             wakenet_model_ != nullptr ? wakenet_model_ : "(none)");
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);

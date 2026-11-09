@@ -132,6 +132,7 @@ void SingleLed::OnStateChanged() {
             TurnOff();
             break;
         case kDeviceStateConnecting:
+        case kDeviceStateThinking:
             SetColor(0, 0, DEFAULT_BRIGHTNESS);
             TurnOn();
             break;

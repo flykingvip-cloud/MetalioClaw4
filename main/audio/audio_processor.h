@@ -13,6 +13,9 @@ public:
     virtual ~AudioProcessor() = default;
     
     virtual void Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) = 0;
+    // 释放 AFE 占用。默认空实现；对话 AFE 必须在唤醒词 AFE 创建前拆掉，反之亦然。
+    virtual void Deinitialize() {}
+    virtual bool IsReady() const { return true; }
     virtual void Feed(std::vector<int16_t>&& data) = 0;
     virtual void Start() = 0;
     virtual void Stop() = 0;

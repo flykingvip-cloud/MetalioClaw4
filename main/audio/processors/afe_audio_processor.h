@@ -6,6 +6,8 @@
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
 
+#include <atomic>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <functional>
@@ -19,6 +21,8 @@ public:
     ~AfeAudioProcessor();
 
     void Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
+    void Deinitialize() override;
+    bool IsReady() const override;
     void Feed(std::vector<int16_t>&& data) override;
     void Start() override;
     void Stop() override;
@@ -30,8 +34,14 @@ public:
 
 private:
     EventGroupHandle_t event_group_ = nullptr;
+    TaskHandle_t fetch_task_ = nullptr;
     const esp_afe_sr_iface_t* afe_iface_ = nullptr;
     esp_afe_sr_data_t* afe_data_ = nullptr;
+    // Feed / destroy 与 fetch 握手。fetch_with_delay 期间不持锁。
+    mutable std::mutex afe_mutex_;
+    std::atomic<bool> fetching_{false};
+    // 成功取过一帧之后，ESP_FAIL 才允许 reset。空 ring 上 reset 会踩到 LSTM。
+    std::atomic<bool> fetch_ok_{false};
     std::function<void(std::vector<int16_t>&& data)> output_callback_;
     std::function<void(bool speaking)> vad_state_change_callback_;
     AudioCodec* codec_ = nullptr;

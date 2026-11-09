@@ -108,6 +108,8 @@ public:
     void EnableWakeWordDetection(bool enable);
     // 销毁唤醒词 AFE/引擎（回桌面用）。Enable(false) 只是软停，内部任务仍可能占 CPU。
     void ReleaseWakeWordEngine();
+    // 销毁对话 AFE。与唤醒词 AFE 不能同时常驻（NS/VAD/WakeNet 共用 LSTM 工作区）。
+    void ReleaseAudioProcessor();
     bool IsWakeWordEngineReady() const { return wake_word_initialized_; }
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);

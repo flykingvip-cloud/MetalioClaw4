@@ -1046,7 +1046,8 @@ void on_record_pressed(lv_event_t* /*e*/) {
     auto& app = Application::GetInstance();
     const DeviceState ds = app.GetDeviceState();
     if (ds == kDeviceStateConnecting || ds == kDeviceStateListening ||
-        ds == kDeviceStateSpeaking || ds == kDeviceStateUpgrading) {
+        ds == kDeviceStateSpeaking || ds == kDeviceStateThinking ||
+        ds == kDeviceStateUpgrading) {
         if (s_record_lbl != nullptr) {
             lv_label_set_text(s_record_lbl, I18n::T("请先结束当前对话"));
         }
